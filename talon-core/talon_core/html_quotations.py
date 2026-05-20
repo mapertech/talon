@@ -6,6 +6,8 @@ messages (without quoted messages) from html
 from __future__ import absolute_import
 import regex as re
 
+from lxml import etree
+
 from talon_core.utils import cssselect 
 
 CHECKPOINT_PREFIX = '#!%!'
@@ -13,7 +15,12 @@ CHECKPOINT_SUFFIX = '!%!#'
 CHECKPOINT_PATTERN = re.compile(CHECKPOINT_PREFIX + r'\d+' + CHECKPOINT_SUFFIX)
 
 # HTML quote indicators (tag ids)
-QUOTE_IDS = ['OLK_SRC_BODY_SECTION']
+QUOTE_IDS = [
+    'OLK_SRC_BODY_SECTION',  # Outlook 2003
+    'divRplyFwdMsg',         # Outlook 2010+ desktop/web reply marker
+    'appendonsend',          # Outlook.com
+    'divtagdefaultwrapper',  # Outlook.com alternate
+]
 RE_FWD = re.compile(r"^[-]+[ ]*Forwarded message[ ]*[-]+$", re.I | re.M)
 
 
@@ -141,12 +148,30 @@ def cut_microsoft_quote(html_message):
 
 
 def cut_by_id(html_message):
+    """Remove elements matching known reply-marker ids and (for Outlook reply
+    markers) every sibling that follows the marker — that's where the quoted
+    body lives in Outlook's standard structure."""
     found = False
     for quote_id in QUOTE_IDS:
         quote = cssselect('#{}'.format(quote_id), html_message)
-        if quote:
-            found = True
-            quote[0].getparent().remove(quote[0])
+        if not quote:
+            continue
+        found = True
+        marker = quote[0]
+        parent = marker.getparent()
+        if parent is None:
+            continue
+
+        # Outlook puts the visual <hr> separator right before divRplyFwdMsg —
+        # drop it too if present.
+        prev = marker.getprevious()
+        if prev is not None and prev.tag == 'hr':
+            parent.remove(prev)
+
+        # Remove the marker and everything after it in the parent.
+        for sib in list(marker.itersiblings()):
+            parent.remove(sib)
+        parent.remove(marker)
     return found
 
 
@@ -163,63 +188,101 @@ def cut_blockquote(html_message):
         return True
 
 
+_FROM_PREFIXES = ('From:', 'Date:', 'De:', 'Fecha:', 'Data:')
+
+
+def _outermost_from_matches(html_message, mode):
+    """Return outermost elements whose text_content (mode='text') or .tail
+    (mode='tail') starts with one of the From: prefixes.
+
+    Uses a Python tree walk rather than lxml XPath because Outlook's
+    Word-exported HTML carries unbound xmlns:o/v/w/m prefixes that crash
+    lxml's XPath engine. The walk is namespace-tolerant.
+
+    'Outermost' means we filter out matches that are descendants of other
+    matches — so for <p><b><span>De:</span></b>...</p> we return the <p>,
+    not the <span>.
+    """
+    raw = []
+    for el in html_message.iter():
+        # Skip Comment / ProcessingInstruction nodes (their .tag is a callable,
+        # not a string) — itertext() raises on them.
+        if not isinstance(el.tag, str):
+            continue
+        if mode == 'text':
+            # Concatenate all text descendants. lxml's _Element has no
+            # .text_content(); itertext() is the etree-native equivalent.
+            text = ''.join(el.itertext())
+        else:
+            text = el.tail or ''
+        if text and text.strip().startswith(_FROM_PREFIXES):
+            raw.append(el)
+    raw_ids = {id(e) for e in raw}
+    outermost = []
+    for el in raw:
+        anc = el.getparent()
+        while anc is not None and id(anc) not in raw_ids:
+            anc = anc.getparent()
+        if anc is None:
+            outermost.append(el)
+    return outermost
+
+
 def cut_from_block(html_message):
     """Cuts div tag which wraps block starting with "From:"."""
-    # handle the case when From: block is enclosed in some tag
-    block = html_message.xpath(
-        ("//*[starts-with(mg:text_content(), 'From:')]|"
-         "//*[starts-with(mg:text_content(), 'Date:')]"))
+    # Case 1: From: block is enclosed in some tag — find the outermost matching
+    # element, walk up to a div ancestor, and remove the div + everything after.
+    block = _outermost_from_matches(html_message, mode='text')
 
     if block:
-        block = block[-1]
+        # Use the FIRST match (earliest in document order) as the cut point so
+        # the removal cascades through every header paragraph and the quoted
+        # body below. Using the last match leaves earlier headers behind.
+        target = block[0]
         parent_div = None
-        while block.getparent() is not None:
-            if block.tag == 'div':
-                parent_div = block
+        node = target
+        while node.getparent() is not None:
+            if node.tag == 'div':
+                parent_div = node
                 break
-            block = block.getparent()
-        if parent_div is not None:
-            maybe_body = parent_div.getparent()
-            # In cases where removing this enclosing div will remove all
-            # content, we should assume the quote is not enclosed in a tag.
-            parent_div_is_all_content = (
-                maybe_body is not None and maybe_body.tag == 'body' and
-                len(maybe_body.getchildren()) == 1)
-
-            if not parent_div_is_all_content:
-                parent = block.getparent()
-                next_sibling = block.getnext()
-
-                # remove all tags after found From block
-                # (From block and quoted message are in separate divs)
-                while next_sibling is not None:
-                    parent.remove(block)
-                    block = next_sibling
-                    next_sibling = block.getnext()
-
-                # remove the last sibling (or the
-                # From block if no siblings)
-                if block is not None:
-                    parent.remove(block)
-
-                return True
-        else:
+            node = node.getparent()
+        if parent_div is None:
             return False
 
-    # handle the case when From: block goes right after e.g. <hr>
-    # and not enclosed in some tag
-    block = html_message.xpath(
-        ("//*[starts-with(mg:tail(), 'From:')]|"
-         "//*[starts-with(mg:tail(), 'Date:')]"))
+        maybe_body = parent_div.getparent()
+        parent_div_is_all_content = (
+            maybe_body is not None and maybe_body.tag == 'body' and
+            len(maybe_body.getchildren()) == 1)
+
+        if not parent_div_is_all_content:
+            # Remove parent_div + every sibling that follows it.
+            parent = parent_div.getparent()
+            for sib in list(parent_div.itersiblings()):
+                parent.remove(sib)
+            parent.remove(parent_div)
+            return True
+
+        # Outlook Word-export wraps content in a single <div class="WordSection1">
+        # whose direct children are <p class="MsoNormal"><b>De:</b>…</p> paragraphs.
+        # Don't remove the whole div — strip the matched paragraph and every
+        # paragraph after it within the same parent.
+        parent = target.getparent()
+        if parent is not None:
+            for sib in list(target.itersiblings()):
+                parent.remove(sib)
+            parent.remove(target)
+            return True
+        return False
+
+    # Case 2: From: block goes right after e.g. <hr> as the next-sibling's tail.
+    block = _outermost_from_matches(html_message, mode='tail')
     if block:
-        block = block[0]
-
-        if RE_FWD.match(block.getparent().text or ''):
+        first = block[0]
+        if RE_FWD.match(first.getparent().text or ''):
             return False
-        
-        while(block.getnext() is not None):
-            block.getparent().remove(block.getnext())
-        block.getparent().remove(block)
+        while first.getnext() is not None:
+            first.getparent().remove(first.getnext())
+        first.getparent().remove(first)
         return True
 
 def cut_zimbra_quote(html_message):

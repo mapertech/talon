@@ -24,7 +24,10 @@ log = logging.getLogger(__name__)
 RE_FWD = re.compile(r"^[-]+[ ]*Forwarded message[ ]*[-]+\s*$", re.I | re.M)
 
 RE_ON_DATE_SMB_WROTE = re.compile(
-    r'(-*[>]?[ ]?({0})[ ].*({1})(.*\n){{0,2}}.*({2}):?-*)'.format(
+    # \b around the beginning and ending verb groups so "sent" doesn't match
+    # inside "presentando"/"presente" (false positive on Spanish prose) and
+    # "El" doesn't match inside "Elena"/"Elefante".
+    r'(-*[>]?[ ]?\b({0})\b[ ].*({1})(.*\n){{0,2}}.*\b({2})\b:?-*)'.format(
         # Beginning of the line
         r'|'.join((
             # English
@@ -39,6 +42,8 @@ RE_ON_DATE_SMB_WROTE = re.compile(
             'Am',
             # Portuguese
             'Em',
+            # Spanish
+            'El',
             # Norwegian
             u'På',
             # Swedish, Danish
@@ -67,6 +72,8 @@ RE_ON_DATE_SMB_WROTE = re.compile(
             'schrieb',
             # Portuguese
             'escreveu',
+            # Spanish
+            u'escribió',
             # Norwegian, Swedish
             'skrev',
             # Vietnamese
@@ -136,6 +143,10 @@ RE_ORIGINAL_MESSAGE = re.compile(r'[\s]*[-]+[ ]*({})[ ]*[-]+'.format(
         u'Ursprüngliche Nachricht', 'Antwort Nachricht',
         # Danish
         'Oprindelig meddelelse',
+        # Spanish
+        'Mensaje original',
+        # Portuguese
+        'Mensagem original',
     ))), re.I)
 
 RE_FROM_COLON_OR_DATE_COLON = re.compile(r'((_+\r?\n)?[\s]*:?[*]?({})[\s]?:([^\n$]+\n){{1,2}}){{2,}}'.format(
@@ -144,10 +155,16 @@ RE_FROM_COLON_OR_DATE_COLON = re.compile(r'((_+\r?\n)?[\s]*:?[*]?({})[\s]?:([^\n
         'From', 'Van', 'De', 'Von', 'Fra', u'Från',
         # "Date" in different languages.
         'Date', '[S]ent', 'Datum', u'Envoyé', 'Skickat', 'Sendt', 'Gesendet',
+        # Spanish "Enviado" / Portuguese "Enviada"; Spanish "Fecha" / Portuguese "Data"
+        'Enviado', 'Enviada', 'Fecha', 'Data',
         # "Subject" in different languages.
         'Subject', 'Betreff', 'Objet', 'Emne', u'Ämne',
+        # Spanish "Asunto" / Portuguese "Assunto"
+        'Asunto', 'Assunto',
         # "To" in different languages.
-        'To', 'An', 'Til', u'À', 'Till'
+        'To', 'An', 'Til', u'À', 'Till',
+        # Spanish/Portuguese "Para"
+        'Para'
     ))), re.I | re.M)
 
 # ---- John Smith wrote ----
@@ -445,12 +462,16 @@ def extract_from_html_tree(html_tree):
     then checking deleted checkpoints,
     then deleting necessary tags.
     """
+    # cut_from_block runs FIRST among the "From: header"-style cuts because it
+    # is the most specific (requires an actual header keyword). cut_blockquote
+    # otherwise short-circuits on inline blockquotes inside quoted content and
+    # leaves the Outlook Word-export De:/From: header block behind.
     cut_quotations = (html_quotations.cut_gmail_quote(html_tree) or
                       html_quotations.cut_zimbra_quote(html_tree) or
-                      html_quotations.cut_blockquote(html_tree) or
-                      html_quotations.cut_microsoft_quote(html_tree) or
                       html_quotations.cut_by_id(html_tree) or
-                      html_quotations.cut_from_block(html_tree)
+                      html_quotations.cut_from_block(html_tree) or
+                      html_quotations.cut_blockquote(html_tree) or
+                      html_quotations.cut_microsoft_quote(html_tree)
                       )
     html_tree_copy = deepcopy(html_tree)
 
