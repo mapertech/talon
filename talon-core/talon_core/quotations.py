@@ -462,17 +462,21 @@ def extract_from_html_tree(html_tree):
     then checking deleted checkpoints,
     then deleting necessary tags.
     """
-    # cut_from_block runs FIRST among the "From: header"-style cuts because it
-    # is the most specific (requires an actual header keyword). cut_blockquote
-    # otherwise short-circuits on inline blockquotes inside quoted content and
-    # leaves the Outlook Word-export De:/From: header block behind.
+    # cut_from_block targets the Outlook Word-export "De:/From:" header block.
+    # It runs unconditionally and FIRST — never inside the short-circuit `or`
+    # chain. An email can carry several independent quote markers at once: e.g.
+    # an Outlook-mobile reply (ms-outlook-* ids, caught by cut_by_id) that
+    # quotes a desktop Outlook thread (the De:/From: block). A match by an
+    # earlier cutter must not short-circuit this one away. Running it first
+    # also keeps cut_blockquote from short-circuiting on inline blockquotes
+    # inside quoted content and leaving the header block behind.
+    from_block_cut = html_quotations.cut_from_block(html_tree)
     cut_quotations = (html_quotations.cut_gmail_quote(html_tree) or
                       html_quotations.cut_zimbra_quote(html_tree) or
                       html_quotations.cut_by_id(html_tree) or
-                      html_quotations.cut_from_block(html_tree) or
                       html_quotations.cut_blockquote(html_tree) or
                       html_quotations.cut_microsoft_quote(html_tree)
-                      )
+                      ) or from_block_cut
     html_tree_copy = deepcopy(html_tree)
 
     number_of_checkpoints = html_quotations.add_checkpoint(html_tree, 0)
